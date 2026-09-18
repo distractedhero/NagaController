@@ -1,7 +1,7 @@
 import Cocoa
 import UserNotifications
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var statusItem: NSStatusItem!
     private let popover = NSPopover()
     private let eventTapManager = EventTapManager.shared
@@ -9,6 +9,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var profileObserver: NSObjectProtocol?
     private var didAlertLowBattery = false
     private var useEmojiInStatus = false
+    private var fallbackWindow: NSWindow?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Ensure Accessibility permissions
@@ -25,6 +26,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Status bar item (variable length to show %)
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        // A stable autosaveName lets AppKit persist/restore this item's slot across
+        // launches instead of treating it as a brand-new, position-less item every time,
+        // which is the leading theory (see upstream #9 and #11) for why the item can
+        // silently fail to render even when the menu bar has free space.
+        statusItem.autosaveName = "NagaController.statusItem"
         if let button = statusItem.button {
             if let icon = NSImage(named: "MenuBar") {
                 icon.isTemplate = true
@@ -68,15 +74,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         updateStatusItemBattery(level: BatteryMonitor.shared.batteryLevel)
 
-        // First launch: the app has no window or Dock icon, so open the popover once to
-        // show where it lives. If the status item didn't make it onto the menu bar (a full
-        // menu bar on a notched MacBook hides items), fall back to an alert.
-        let firstLaunchKey = "NagaController.didShowFirstLaunchPopover"
-        if !UserDefaults.standard.bool(forKey: firstLaunchKey) {
-            UserDefaults.standard.set(true, forKey: firstLaunchKey)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
-                self?.showFirstLaunchHint()
-            }
+        // The status item can silently fail to render — seen even with plenty of free
+        // space in the menu bar, not just a full one. Check on every launch (not only the
+        // first) and guarantee access via a real window if it's genuinely not on screen,
+        // rather than relying on a one-shot alert that only ever fires once per install.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            self?.verifyStatusItemVisibleOrFallback()
         }
 
         // Start event tap based on persisted setting
@@ -89,15 +92,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let profileObserver { NotificationCenter.default.removeObserver(profileObserver) }
     }
 
-    private func showFirstLaunchHint() {
-        NSApp.activate(ignoringOtherApps: true)
-        if let button = statusItem.button, button.window?.isVisible == true, !popover.isShown {
-            togglePopover(nil)
+    private func verifyStatusItemVisibleOrFallback() {
+        if statusItem.isVisible, let button = statusItem.button, button.window?.isVisible == true {
+            // The item is genuinely on screen. Show the popover once per install so
+            // first-time users know where the app lives.
+            let firstLaunchKey = "NagaController.didShowFirstLaunchPopover"
+            if !UserDefaults.standard.bool(forKey: firstLaunchKey) {
+                UserDefaults.standard.set(true, forKey: firstLaunchKey)
+                NSApp.activate(ignoringOtherApps: true)
+                if !popover.isShown {
+                    togglePopover(nil)
+                }
+            }
             return
         }
+        // The status item didn't make it onto the menu bar. A process with no Dock icon
+        // and no visible menu bar item has no reliable surface to present modal UI on, so
+        // don't just show an alert and hope — guarantee a way in with a real window.
+        activateFallbackWindow()
+    }
+
+    private func activateFallbackWindow() {
+        NSLog("[MenuBar] Status item not visible after launch; opening fallback window.")
+        NSApp.setActivationPolicy(.regular)
+        NSApp.activate(ignoringOtherApps: true)
+
+        let controller = MainViewController()
+        let window = NSWindow(contentViewController: controller)
+        window.title = "NagaController"
+        window.styleMask = [.titled, .closable, .miniaturizable]
+        window.isReleasedWhenClosed = false
+        window.center()
+        window.delegate = self
+        fallbackWindow = window
+        window.makeKeyAndOrderFront(nil)
+
         let alert = NSAlert()
-        alert.messageText = "NagaController runs in the menu bar"
-        alert.informativeText = "There is no window or Dock icon. Look for the mouse icon in the menu bar to enable remapping and configure buttons. If you don't see it, your menu bar may be full; remove or hide a few other items so it fits."
+        alert.messageText = "NagaController's menu bar icon didn't appear"
+        alert.informativeText = "This can happen even when the menu bar has free space. Use this window instead — it stays reachable from the Dock while it's open, and NagaController goes back to running quietly in the background once you close it."
         alert.alertStyle = .informational
         alert.addButton(withTitle: "OK")
         alert.runModal()
@@ -143,6 +175,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             button.title = (hasImage ? " " : "🖱️ ") + profile
             button.toolTip = "Naga battery: — · Profile: \(profile)"
         }
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        guard let window = notification.object as? NSWindow, window === fallbackWindow else { return }
+        fallbackWindow = nil
+        NSApp.setActivationPolicy(.accessory)
     }
 
     private func requestNotificationAuthorizationIfPossible() {
